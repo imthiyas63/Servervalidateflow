@@ -3,7 +3,9 @@ name: Server-Side Commit Validation
 on:
   push:
     branches:
-      - '**'  # Matches ALL branches dynamically
+      - '**'
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
   validate-push:
@@ -14,41 +16,61 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all history
+          fetch-depth: 0
 
       - name: Check Commit Messages
         run: |
-          echo "🔍 Checking commits pushed to ${{ github.ref_name }}..."
+          echo "🔍 Checking commits..."
           echo "=================================================="
           
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.event.after }}"
           FAILED=0
           
-          # ROBUST COMMIT EXTRACTION
-          # 1. If it's a new branch, BEFORE is all zeros.
-          # 2. If the range is invalid (e.g., due to force push quirks), fallback to last 20 commits.
-          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
-              echo "ℹ️ New branch detected. Checking last 20 commits."
-              COMMITS=$(git log --format="%H|%s" -n 20 HEAD)
+          # SMART COMMIT DETECTION
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "📋 Mode: Pull Request Validation (checking last 10 commits)"
+            # Added %P to capture parent hashes for merge detection
+            COMMITS=$(git log --format="%H|%P|%s" -n 10 HEAD)
+            
+          elif [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+            echo "📋 Mode: New Branch (checking last 5 commits)"
+            COMMITS=$(git log --format="%H|%P|%s" -n 5 HEAD)
+            
           else
-              echo "ℹ️ Checking range: $BEFORE..$AFTER"
-              # Attempt to get the range. If it fails (exit code 128), fallback to last 20 commits.
-              COMMITS=$(git log --format="%H|%s" $BEFORE..$AFTER 2>/dev/null || git log --format="%H|%s" -n 20 HEAD)
+            echo "📋 Mode: Regular Push"
+            COMMITS=$(git log --format="%H|%P|%s" ${{ github.event.before }}..${{ github.event.after }} 2>/dev/null)
+            
+            if [ -z "$COMMITS" ]; then
+              echo "ℹ️ Invalid range detected, checking last 5 commits"
+              COMMITS=$(git log --format="%H|%P|%s" -n 5 HEAD)
+            fi
           fi
           
           if [ -z "$COMMITS" ]; then
-              echo "✅ No new commits to validate."
-              exit 0
+            echo "✅ No new commits to validate."
+            exit 0
           fi
           
           echo ""
-          while IFS='|' read -r HASH MSG; do
+          echo "Validating $(echo "$COMMITS" | wc -l) commit(s)..."
+          echo "=================================================="
+          
+          # Read HASH, PARENTS, and MESSAGE
+          while IFS='|' read -r HASH PARENTS MSG; do
             [ -z "$MSG" ] && continue
             SHORT=$(echo "$HASH" | cut -c1-7)
             
             echo "Checking [$SHORT]: $MSG"
-            
+
+            # 🌟 YOUR EXCELLENT ADDITION: Skip merge/auto-generated commits
+            if [ -n "$PARENTS" ] && echo "$PARENTS" | grep -q ' '; then
+              echo "   ℹ️ Skipping merge commit"
+              continue
+            fi
+            if echo "$MSG" | grep -qE '^(Merge |Initial commit|Revert )'; then
+              echo "   ℹ️ Skipping auto-generated or initial commit message"
+              continue
+            fi
+
             # 1. Check for Issue Reference
             if ! echo "$MSG" | grep -qE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+'; then
               echo "   ❌ Missing issue reference (#123)"
@@ -73,8 +95,17 @@ jobs:
           echo "=================================================="
           if [ $FAILED -ne 0 ]; then
             echo "🚨 VALIDATION FAILED. Fix your commits and force push."
-            echo "💡 Run: git commit --amend -m '#123: proper message'"
-            echo "💡 Run: git push --force origin ${{ github.ref_name }}"
+            echo ""
+            echo "💡 HOW TO FIX THIS COMMIT:"
+            echo "   1. git commit --amend -m '#123: proper message'"
+            echo "   2. git push --force origin ${{ github.ref_name }}"
+            echo ""
+            echo "⚠️ PREVENT THIS IN THE FUTURE:"
+            echo "   Your local pre-commit hook did not catch this!"
+            echo "   Run this command once to enable local validation:"
+            echo "   git config --global core.hooksPath .githooks"
+            echo ""
+            echo "::error::🚨 Pull Request blocked! Fix your commit messages."
             exit 1
           else
             echo "✅ All pushed commits are valid!"
