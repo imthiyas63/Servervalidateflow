@@ -1,0 +1,81 @@
+name: Server-Side Commit Validation
+
+on:
+  push:
+    branches:
+      - '**'  # Matches ALL branches dynamically
+
+jobs:
+  validate-push:
+    name: Validate Pushed Commits
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history
+
+      - name: Check Commit Messages
+        run: |
+          echo "🔍 Checking commits pushed to ${{ github.ref_name }}..."
+          echo "=================================================="
+          
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          FAILED=0
+          
+          # ROBUST COMMIT EXTRACTION
+          # 1. If it's a new branch, BEFORE is all zeros.
+          # 2. If the range is invalid (e.g., due to force push quirks), fallback to last 20 commits.
+          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              echo "ℹ️ New branch detected. Checking last 20 commits."
+              COMMITS=$(git log --format="%H|%s" -n 20 HEAD)
+          else
+              echo "ℹ️ Checking range: $BEFORE..$AFTER"
+              # Attempt to get the range. If it fails (exit code 128), fallback to last 20 commits.
+              COMMITS=$(git log --format="%H|%s" $BEFORE..$AFTER 2>/dev/null || git log --format="%H|%s" -n 20 HEAD)
+          fi
+          
+          if [ -z "$COMMITS" ]; then
+              echo "✅ No new commits to validate."
+              exit 0
+          fi
+          
+          echo ""
+          while IFS='|' read -r HASH MSG; do
+            [ -z "$MSG" ] && continue
+            SHORT=$(echo "$HASH" | cut -c1-7)
+            
+            echo "Checking [$SHORT]: $MSG"
+            
+            # 1. Check for Issue Reference
+            if ! echo "$MSG" | grep -qE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+'; then
+              echo "   ❌ Missing issue reference (#123)"
+              echo "::error title=Invalid Commit:: [$SHORT] Missing issue reference in: '$MSG'"
+              FAILED=1
+              continue
+            fi
+            
+            # 2. Check Description Length
+            CLEAN=$(echo "$MSG" | sed -E 's/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+#[0-9]+//g; s/[a-zA-Z0-9_-]+#[0-9]+//g; s/#[0-9]+//g' | sed 's/^[ :.-]*//;s/[ :.-]*$//')
+            
+            if [ ${#CLEAN} -lt 5 ]; then
+              echo "   ❌ Description too short (min 5 chars)"
+              echo "::error title=Invalid Commit:: [$SHORT] Description too short in: '$MSG'"
+              FAILED=1
+              continue
+            fi
+            
+            echo "   ✅ Valid"
+          done <<< "$COMMITS"
+          
+          echo "=================================================="
+          if [ $FAILED -ne 0 ]; then
+            echo "🚨 VALIDATION FAILED. Fix your commits and force push."
+            echo "💡 Run: git commit --amend -m '#123: proper message'"
+            echo "💡 Run: git push --force origin ${{ github.ref_name }}"
+            exit 1
+          else
+            echo "✅ All pushed commits are valid!"
+          fi
