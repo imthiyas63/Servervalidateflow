@@ -25,7 +25,6 @@ jobs:
       - name: Check Commit Messages (Validate open & assigned)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Set to "true" to allow validation when commit author could not be resolved to a GitHub account
           ALLOW_UNKNOWN_AUTHOR: "false"
         run: |
           set -euo pipefail
@@ -35,17 +34,19 @@ jobs:
 
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY##*/}"
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.event.after }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           FAILED=0
 
-          # Build a safe commit list including parent SHAs so merges can be detected
-          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
-            echo "ℹ️ New branch detected. Checking last 50 commits."
-            COMMITS=$(git log --format='%H%x01%s%x01%P' -n 50 HEAD)
+          # Fetch the default branch to compare against (ensures we only check NEW commits)
+          git fetch origin $DEFAULT_BRANCH --depth=100 2>/dev/null || true
+
+          # Build a safe commit list: ONLY commits unique to this branch/PR
+          if git rev-parse --verify origin/$DEFAULT_BRANCH >/dev/null 2>&1; then
+            echo "ℹ️ Comparing against default branch: $DEFAULT_BRANCH"
+            COMMITS=$(git log --format='%H%x01%s%x01%P' origin/$DEFAULT_BRANCH..HEAD 2>/dev/null)
           else
-            echo "ℹ️ Checking range: $BEFORE..$AFTER"
-            COMMITS=$(git log --format='%H%x01%s%x01%P' $BEFORE..$AFTER 2>/dev/null || git log --format='%H%x01%s%x01%P' -n 50 HEAD)
+            echo "ℹ️ Fallback: Checking last 20 commits"
+            COMMITS=$(git log --format='%H%x01%s%x01%P' -n 20 HEAD)
           fi
 
           if [ -z "$COMMITS" ]; then
