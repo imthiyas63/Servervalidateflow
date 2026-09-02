@@ -1,117 +1,119 @@
 #!/bin/bash
 # ==============================================================================
-# GIT PRE-COMMIT HOOK: Minimalist Multi-Issue Validation
+# GIT PRE-COMMIT HOOK: Hybrid Multi-Issue Validation (Curl + gh Fallback)
 # ==============================================================================
-# PURPOSE:
-#   Validates that a commit message references at least one valid, open GitHub 
-#   issue that is assigned to the committer. 
-#
-# KEY FEATURES:
-#   1. Multi-Issue Support: Checks all referenced issues. Passes if ANY ONE is 
-#      valid (open and assigned to you), saving time and API calls.
-#   2. Dynamic Repo Detection: Automatically detects the current repo. Supports 
-#      cross-repo references (e.g., "owner/repo#123") without hardcoding.
-#   3. Zero External Dependencies: Uses 'gh' CLI if available. Falls back to 
-#      pure POSIX 'curl' + 'grep'/'sed' so 'jq' is NOT required.
-#   4. Clean Terminal Output: Strictly 1-line success or error messages.
-# ==============================================================================
+# FLOW:
+#   1. Detect the current GitHub repository from remote.origin.url.
+#   2. Read and clean the commit message.
+#   3. Extract all GitHub issue references from the commit message.
+#   4. Validate that the commit contains a description of at least 5 characters.
+#   5. Authenticate using git config github.token, with gh CLI as a fallback.
+#   6. Determine the GitHub username from git config, gh CLI, or the GitHub API.
+#   7. Check every referenced issue, including cross-repository references.
+#   8. Allow the commit if at least one referenced issue is open and assigned to
+#      the authenticated GitHub user.
+#   9. Reject the commit if no valid issue is found.
+#  10. Display only a single-line success or error message.
 
-# ==============================================================================
+# ==========================================
 # 1. SETUP & DYNAMIC REPO DETECTION
-# ==============================================================================
-# Extract the current repository's owner and name from the Git remote URL.
-# This ensures the script works in ANY repository without manual configuration.
+# ==========================================
 REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null)
 CURRENT_OWNER=$(echo "$REMOTE_URL" | sed -E 's/.*[/:]([^/]+)\/([^/.]+)(\.git)?$/\1/')
 CURRENT_REPO=$(echo "$REMOTE_URL" | sed -E 's/.*[/:]([^/]+)\/([^/.]+)(\.git)?$/\2/')
 
-# Authenticate: Use environment variable if set, otherwise fallback to GitHub CLI
-GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || echo "")}"
 GITHUB_API="https://api.github.com"
 
-# ==============================================================================
+# ==========================================
 # 2. READ AND CLEAN COMMIT MESSAGE
-# ==============================================================================
-# Git passes the commit message file path as the first argument ($1).
-# We read it, strip Windows carriage returns (\r), and trim leading/trailing spaces.
+# ==========================================
 COMMIT_MSG=$(cat "$1" 2>/dev/null | tr -d '\r' | sed 's/^[ \t]*//;s/[ \t]*$//')
-
-# Fail immediately if the message is completely empty
 [ -z "$COMMIT_MSG" ] && echo -e "\033[0;31m[ERROR]\033[0m Empty commit message." && exit 1
 
-# ==============================================================================
+# ==========================================
 # 3. EXTRACT ISSUES & VALIDATE DESCRIPTION
-# ==============================================================================
-# Extract ALL issue references using regex. Matches:
-#   - owner/repo#123  (Cross-repo)
-#   - repo#123        (Same org, different repo)
-#   - #123            (Current repo)
+# ==========================================
 ISSUES=$(echo "$COMMIT_MSG" | grep -oE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+')
-
-# Fail if no issue tags are found at all
 [ -z "$ISSUES" ] && echo -e "\033[0;31m[ERROR]\033[0m No issue reference found (use #123 or owner/repo#123)." && exit 1
 
-# Strip all issue tags from the message to isolate the actual text description.
-# Then check if the remaining description is at least 5 characters long.
 CHANGE_DESC=$(echo "$COMMIT_MSG" | sed -E 's/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+#[0-9]+//g; s/[a-zA-Z0-9_-]+#[0-9]+//g; s/#[0-9]+//g' | sed 's/^[ :.-]*//;s/[ :.-]*$//')
 [ ${#CHANGE_DESC} -lt 5 ] && echo -e "\033[0;31m[ERROR]\033[0m Description too short (min 5 chars)." && exit 1
 
-# ==============================================================================
-# 4. AUTHENTICATION & USERNAME CHECK
-# ==============================================================================
-# Fail early if no GitHub token is available
-[ -z "$GITHUB_TOKEN" ] && echo -e "\033[0;31m[ERROR]\033[0m Missing GitHub auth. Run 'gh auth login'." && exit 1
+# ==========================================
+# 4. HYBRID AUTHENTICATION & USERNAME CHECK
+# ==========================================
 
-# Determine the committer's GitHub username (2-tier fallback)
-GITHUB_USERNAME=$(git config github.user 2>/dev/null)
+# 1. Find the Token: Check Git Config first, fallback to gh CLI
+GITHUB_TOKEN=$(git config --get github.token 2>/dev/null)
+USE_GH=false
 
-# If not in git config, try to fetch it via 'gh' CLI and save it for next time
-if [ -z "$GITHUB_USERNAME" ] && command -v gh >/dev/null 2>&1; then
-    GITHUB_USERNAME=$(gh api user --jq '.login' 2>/dev/null)
-    [ -n "$GITHUB_USERNAME" ] && git config github.user "$GITHUB_USERNAME"
+if [ -z "$GITHUB_TOKEN" ]; then
+    if command -v gh >/dev/null 2>&1; then
+        GITHUB_TOKEN=$(gh auth token 2>/dev/null)
+        if [ -n "$GITHUB_TOKEN" ]; then USE_GH=true; fi
+    fi
 fi
 
-# Fail if we still cannot determine the username
-[ -z "$GITHUB_USERNAME" ] && echo -e "\033[0;31m[ERROR]\033[0m Cannot determine GitHub username. Set via 'git config github.user <name>'." && exit 1
+if [ -z "$GITHUB_TOKEN" ]; then
+    echo -e "\033[0;31m[ERROR]\033[0m Missing GitHub auth. Run 'gh auth login' or set git config github.token."
+    exit 1
+fi
 
-# ==============================================================================
-# 5. THE "ANY ONE VALID" LOOP (Fail-Fast Success)
-# ==============================================================================
+# 2. Find the Username: Check Git Config first
+GITHUB_USERNAME=$(git config --get github.user 2>/dev/null)
+
+if [ -z "$GITHUB_USERNAME" ]; then
+    if [ "$USE_GH" = true ]; then
+        GITHUB_USERNAME=$(gh api user --jq '.login' 2>/dev/null)
+    else
+        GITHUB_USERNAME=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user | grep -o '"login": *"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
+    fi
+    
+    if [ -n "$GITHUB_USERNAME" ]; then
+        git config --global github.user "$GITHUB_USERNAME"
+    fi
+fi
+
+if [ -z "$GITHUB_USERNAME" ]; then
+    echo -e "\033[0;31m[ERROR]\033[0m Cannot determine GitHub username. Set via 'git config --global github.user <name>'."
+    exit 1
+fi
+
+# ==========================================
+# 5. THE "ANY ONE VALID" LOOP (Hybrid Fetch)
+# ==========================================
 VALID_ISSUE_FOUND=false
 
 for REF in $ISSUES; do
-    # Parse the reference string into Owner, Repo, and Issue Number
+    # Parse the reference string
     if [[ "$REF" == *"/"* ]]; then
-        # Format: owner/repo#123
         TARGET_OWNER="${REF%%/*}"; REST="${REF#*/}"; TARGET_REPO="${REST%%#*}"; ISSUE_NUM="${REST#*#}"
     elif [[ "$REF" == *"#"* && "$REF" != "#"* ]]; then
-        # Format: repo#123
         TARGET_OWNER="$CURRENT_OWNER"; TARGET_REPO="${REF%%#*}"; ISSUE_NUM="${REF#*#}"
     else
-        # Format: #123
         TARGET_OWNER="$CURRENT_OWNER"; TARGET_REPO="$CURRENT_REPO"; ISSUE_NUM="${REF#*#}"
     fi
 
-    # Fetch Issue Data (Smart Fallback: 'gh' CLI is preferred, 'curl' is backup)
-    if command -v gh >/dev/null 2>&1; then
-        ISSUE_RESPONSE=$(gh api repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${ISSUE_NUM} 2>/dev/null)
+    # Fetch Issue Data (Use 'gh' if available, otherwise pure 'curl')
+    if [ "$USE_GH" = true ]; then
         ISSUE_STATE=$(gh api repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${ISSUE_NUM} --jq '.state' 2>/dev/null)
         ASSIGNEES=$(gh api repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${ISSUE_NUM} --jq '.assignees[].login' 2>/dev/null | tr '\n' ' ')
+
+        # Check if issue exists
+        if [ -z "$ISSUE_STATE" ]; then continue; fi
     else
-        # Pure POSIX fallback for environments without 'gh' or 'jq'
         ISSUE_RESPONSE=$(curl -s -f -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "${GITHUB_API}/repos/${TARGET_OWNER}/${TARGET_REPO}/issues/${ISSUE_NUM}" 2>/dev/null)
+        
+        echo "$ISSUE_RESPONSE" | grep -q '"message": "Not Found"' && continue
+        
         ISSUE_STATE=$(echo "$ISSUE_RESPONSE" | grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
         
-        # Minify JSON and extract the assignees array safely using sed/grep
         MINIFIED=$(echo "$ISSUE_RESPONSE" | tr -d '\n\r\t' | sed 's/  *//g')
         ASSIGNEES_SECTION=$(echo "$MINIFIED" | sed -n 's/.*"assignees"[[:space:]]*:[[:space:]]*\[\(.*\)\][[:space:]]*,[[:space:]]*".*/\1/p')
         [ -z "$ASSIGNEES_SECTION" ] && ASSIGNEES_SECTION=$(echo "$MINIFIED" | sed -n 's/.*"assignees"[[:space:]]*:[[:space:]]*\[\(.*\)\][[:space:]]*}.*/\1/p')
         ASSIGNEES=$(echo "$ASSIGNEES_SECTION" | grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | tr '\n' ' ')
     fi
 
-    # Skip to the next issue if this one doesn't exist
-    echo "$ISSUE_RESPONSE" | grep -q '"message": "Not Found"' && continue
-    
     # Check if the current user is in the list of assignees
     IS_ASSIGNED=false
     for ASSIGNEE in $ASSIGNEES; do 
@@ -121,19 +123,17 @@ for REF in $ISSUES; do
     # FAIL-FAST: If THIS issue is open AND assigned to the user, we are done!
     if [ "$ISSUE_STATE" == "open" ] && [ "$IS_ASSIGNED" == "true" ]; then
         VALID_ISSUE_FOUND=true
-        break # Stop checking other issues immediately
+        break 
     fi
 done
 
-# ==============================================================================
+# ==========================================
 # 6. FINAL VERDICT (Strictly 1-Line Terminal Output)
-# ==============================================================================
+# ==========================================
 if [ "$VALID_ISSUE_FOUND" == "true" ]; then
-    # Success: Allow the commit to proceed
     echo -e "\033[0;32m[PASS]\033[0m Valid issue found. Commit allowed."
     exit 0
 else
-    # Failure: Block the commit. Developer must fix the message or issue assignment.
     echo -e "\033[0;31m[ERROR]\033[0m No open issue assigned to you found in message."
     exit 1
 fi
