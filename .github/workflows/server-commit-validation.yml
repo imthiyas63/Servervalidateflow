@@ -3,78 +3,175 @@ name: Server-Side Commit Validation
 on:
   push:
     branches:
-      - '**'  # Matches ALL branches dynamically
+      - '**'
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
   validate-push:
     name: Validate Pushed Commits
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all history
+          fetch-depth: 0
 
-      - name: Check Commit Messages
+      - name: Install jq (for robust JSON parsing)
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Check Commit Messages (Validate open & assigned)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_UNKNOWN_AUTHOR: "false"
+        run: |
+          set -euo pipefail
+
           echo "🔍 Checking commits pushed to ${{ github.ref_name }}..."
           echo "=================================================="
-          
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.event.after }}"
+
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           FAILED=0
-          
-          # ROBUST COMMIT EXTRACTION
-          # 1. If it's a new branch, BEFORE is all zeros.
-          # 2. If the range is invalid (e.g., due to force push quirks), fallback to last 20 commits.
-          if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
-              echo "ℹ️ New branch detected. Checking last 20 commits."
-              COMMITS=$(git log --format="%H|%s" -n 20 HEAD)
+
+          # Fetch the default branch to compare against (ensures we only check NEW commits)
+          git fetch origin $DEFAULT_BRANCH --depth=100 2>/dev/null || true
+
+          # Build a safe commit list: ONLY commits unique to this branch/PR
+          if git rev-parse --verify origin/$DEFAULT_BRANCH >/dev/null 2>&1; then
+            echo "ℹ️ Comparing against default branch: $DEFAULT_BRANCH"
+            COMMITS=$(git log --format='%H%x01%s%x01%P' origin/$DEFAULT_BRANCH..HEAD 2>/dev/null)
           else
-              echo "ℹ️ Checking range: $BEFORE..$AFTER"
-              # Attempt to get the range. If it fails (exit code 128), fallback to last 20 commits.
-              COMMITS=$(git log --format="%H|%s" $BEFORE..$AFTER 2>/dev/null || git log --format="%H|%s" -n 20 HEAD)
+            echo "ℹ️ Fallback: Checking last 20 commits"
+            COMMITS=$(git log --format='%H%x01%s%x01%P' -n 20 HEAD)
           fi
-          
+
           if [ -z "$COMMITS" ]; then
-              echo "✅ No new commits to validate."
-              exit 0
+            echo "✅ No new commits to validate."
+            exit 0
           fi
-          
+
           echo ""
-          while IFS='|' read -r HASH MSG; do
+          # Loop commits using ASCII 0x01 as delimiter to avoid conflicts with message characters
+          while IFS=$'\x01' read -r HASH MSG PARENTS; do
             [ -z "$MSG" ] && continue
             SHORT=$(echo "$HASH" | cut -c1-7)
-            
             echo "Checking [$SHORT]: $MSG"
-            
-            # 1. Check for Issue Reference
-            if ! echo "$MSG" | grep -qE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+'; then
+
+            # Skip merge commits (multiple parents) and auto-generated messages
+            if [ -n "$PARENTS" ] && echo "$PARENTS" | grep -q ' '; then
+              echo "   ℹ️ Skipping merge commit"
+              continue
+            fi
+            if echo "$MSG" | grep -qE '^(Merge |Initial commit|Revert )'; then
+              echo "   ℹ️ Skipping auto-generated or initial commit message"
+              continue
+            fi
+
+            # Extract any issue references in the commit message
+            REFS=$(echo "$MSG" | grep -oE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+#[0-9]+|[a-zA-Z0-9_-]+#[0-9]+|#[0-9]+' || true)
+            if [ -z "$REFS" ]; then
               echo "   ❌ Missing issue reference (#123)"
               echo "::error title=Invalid Commit:: [$SHORT] Missing issue reference in: '$MSG'"
               FAILED=1
               continue
             fi
-            
-            # 2. Check Description Length
-            CLEAN=$(echo "$MSG" | sed -E 's/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+#[0-9]+//g; s/[a-zA-Z0-9_-]+#[0-9]+//g; s/#[0-9]+//g' | sed 's/^[ :.-]*//;s/[ :.-]*$//')
-            
-            if [ ${#CLEAN} -lt 5 ]; then
-              echo "   ❌ Description too short (min 5 chars)"
-              echo "::error title=Invalid Commit:: [$SHORT] Description too short in: '$MSG'"
-              FAILED=1
-              continue
+
+            # Get commit author login from GitHub commit object
+            COMMIT_API="https://api.github.com/repos/$OWNER/$REPO/commits/$HASH"
+            AUTHOR_LOGIN=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$COMMIT_API" \
+                           | jq -r '.author.login // empty')
+
+            if [ -z "$AUTHOR_LOGIN" ]; then
+              echo "   ⚠️ Could not resolve commit author to a GitHub user for [$SHORT]."
+              if [ "$ALLOW_UNKNOWN_AUTHOR" != "true" ]; then
+                echo "   ❌ Failing because author cannot be matched to a GitHub account."
+                echo "::error title=Invalid Commit:: [$SHORT] Cannot determine GitHub author for commit $HASH. Ensure the commit email is associated with a GitHub account."
+                FAILED=1
+                continue
+              else
+                echo "   ℹ️ ALLOW_UNKNOWN_AUTHOR=true — falling back to 'open issue' check only."
+              fi
+            else
+              echo "   ℹ️ Commit author resolved as GitHub user: $AUTHOR_LOGIN"
             fi
-            
-            echo "   ✅ Valid"
+
+            # For each referenced issue, check state and assignees. A commit passes if ANY referenced issue:
+            # 1. exists, 2. is open, 3. (if author resolved) is assigned to the commit author
+            COMMIT_OK=false
+            for REF in $REFS; do
+              # Normalize reference -> TOWNER/TREPO/NUM
+              if [[ "$REF" == *"/"* ]]; then
+                TOWNER="${REF%%/*}"
+                REST="${REF#*/}"
+                TREPO="${REST%%#*}"
+                NUM="${REST#*#}"
+              elif [[ "$REF" == *"#"* && "$REF" != "#"* ]]; then
+                TOWNER="$OWNER"
+                TREPO="${REF%%#*}"
+                NUM="${REF#*#}"
+              else
+                TOWNER="$OWNER"
+                TREPO="$REPO"
+                NUM="${REF#*#}"
+              fi
+
+              ISSUE_API="https://api.github.com/repos/$TOWNER/$TREPO/issues/$NUM"
+              ISSUE_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$ISSUE_API")
+
+              # Detect Not Found
+              if echo "$ISSUE_JSON" | jq -e '.message == "Not Found"' >/dev/null 2>&1; then
+                echo "   ⚠️ Referenced issue $TOWNER/$TREPO#$NUM not found — skipping this reference."
+                continue
+              fi
+
+              STATE=$(echo "$ISSUE_JSON" | jq -r '.state // empty')
+              ASSIGNEES=$(echo "$ISSUE_JSON" | jq -r '.assignees[].login' 2>/dev/null || true)
+
+              if [ "$STATE" != "open" ]; then
+                echo "   ⚠️ Referenced issue $TOWNER/$TREPO#$NUM is not open (state=$STATE) — skipping."
+                continue
+              fi
+
+              if [ -n "$AUTHOR_LOGIN" ]; then
+                # Require author to be listed among assignees
+                if echo " $ASSIGNEES " | grep -qE " ${AUTHOR_LOGIN} "; then
+                  echo "   ✅ Referenced issue $TOWNER/$TREPO#$NUM is open and assigned to $AUTHOR_LOGIN"
+                  COMMIT_OK=true
+                  break
+                else
+                  echo "   ⚠️ Referenced issue $TOWNER/$TREPO#$NUM is open but not assigned to $AUTHOR_LOGIN"
+                  continue
+                fi
+              else
+                # Author unknown: accept based on open state only if ALLOW_UNKNOWN_AUTHOR=true
+                if [ "$ALLOW_UNKNOWN_AUTHOR" == "true" ]; then
+                  echo "   ✅ Referenced issue $TOWNER/$TREPO#$NUM is open (author unknown; ALLOW_UNKNOWN_AUTHOR=true)"
+                  COMMIT_OK=true
+                  break
+                fi
+              fi
+            done
+
+            if [ "$COMMIT_OK" = "true" ]; then
+              echo "   ✅ Valid"
+            else
+              echo "   ❌ Commit did not point to an open issue assigned to the commit author"
+              echo "::error title=Invalid Commit:: [$SHORT] Commit must reference an open issue assigned to the commit author: '$MSG'"
+              FAILED=1
+            fi
+
           done <<< "$COMMITS"
-          
+
           echo "=================================================="
           if [ $FAILED -ne 0 ]; then
             echo "🚨 VALIDATION FAILED. Fix your commits and force push."
-            echo "💡 Run: git commit --amend -m '#123: proper message'"
-            echo "💡 Run: git push --force origin ${{ github.ref_name }}"
+            echo "💡 To fix: git commit --amend -m '#<issue>: message' && git push --force origin ${{ github.ref_name }}"
+            echo "⚠️ PREVENT THIS: Ensure local hooks are installed (git config --global core.hooksPath .githooks)"
+            echo "::error::🚨 Validation failed! Fix your commit messages."
             exit 1
           else
             echo "✅ All pushed commits are valid!"
